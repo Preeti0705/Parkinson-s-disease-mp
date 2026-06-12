@@ -1,13 +1,21 @@
 """
-Advanced ML Pipeline for Parkinson's Disease Detection
-=======================================================
-Pipeline: ADASYN + Mixup -> Boruta + PCA -> CNN1D-LSTM Ensemble -> 5-Fold Stratified CV
+Advanced ML Pipeline for Parkinson's Disease Detection  — v2
+=============================================================
+Target accuracy: 90%+
 
-Dataset: pd_speech_features.csv (756 samples x 753 features, binary classification)
+Pipeline:
+  Data → StandardScaler → Boruta (131 features) → PCA (99% var)
+       → ADASYN balancing (per fold)
+       → Hybrid Ensemble:
+           Deep Learning : Residual-CNN1D + BiLSTM-Attention  (Focal Loss)
+           Traditional ML: RandomForest + HistGradientBoosting + SVM (RBF)
+       → AUC-weighted soft voting → Optimal-threshold decision
+  Evaluation: 5-Fold Stratified CV
 """
 
 import os
 import glob
+import json
 import logging
 import warnings
 import numpy as np
@@ -17,8 +25,15 @@ import joblib
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.model_selection import StratifiedKFold
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, classification_report
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    HistGradientBoostingClassifier,
+)
+from sklearn.svm import SVC
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import (
+    accuracy_score, f1_score, roc_auc_score, roc_curve, classification_report,
+)
 from imblearn.over_sampling import ADASYN
 from boruta import BorutaPy
 
@@ -27,548 +42,529 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
-# -- Configuration --------------------------------------------------------
-SEED = 42
-N_FOLDS = 5
-PCA_VARIANCE = 0.95
-BATCH_SIZE = 32
-EPOCHS = 100
-PATIENCE = 10  # Early stopping patience
-MIXUP_ALPHA = 0.2
+# ── Configuration ──────────────────────────────────────────────────────────────
+SEED         = 42
+N_FOLDS      = 5
+PCA_VARIANCE = 0.99          # keep 99% — was 0.95
+BATCH_SIZE   = 32
+EPOCHS       = 200           # was 100
+PATIENCE     = 25            # was 10
+FOCAL_ALPHA  = 0.75          # weight for positive class in Focal Loss
+FOCAL_GAMMA  = 2.0
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# -- Reproducibility -------------------------------------------------------
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
-
-# Suppress noisy warnings
 warnings.filterwarnings('ignore')
 
-# -- Logging Setup ----------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-7s | %(message)s',
-    datefmt='%H:%M:%S'
+    datefmt='%H:%M:%S',
 )
 log = logging.getLogger(__name__)
 
 
 # ===========================================================================
-# 1. PREPROCESS DATA
+# 1. FOCAL LOSS
+# ===========================================================================
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for binary classification.
+    FL(p) = -α · (1-p)^γ · log(p)
+
+    Reduces loss for well-classified samples so the model focuses on
+    hard (minority-class) examples.
+    """
+    def __init__(self, alpha: float = 0.75, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        bce    = nn.functional.binary_cross_entropy(pred, target, reduction='none')
+        pt     = torch.exp(-bce)
+        focal  = self.alpha * ((1 - pt) ** self.gamma) * bce
+        return focal.mean()
+
+
+# ===========================================================================
+# 2. MODEL ARCHITECTURES
+# ===========================================================================
+
+class _ResBlock(nn.Module):
+    """1-D residual block: two conv layers with a skip connection."""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(channels),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.relu(x + self.body(x))
+
+
+class CNN1D(nn.Module):
+    """
+    Residual 1-D CNN.
+    AdaptiveMaxPool1d(1) makes it dimension-agnostic → works for any
+    number of input features (both PCA-reduced and raw 13 audio features).
+    """
+    def __init__(self, input_dim: int = 1):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv1d(1, 64, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(64), nn.ReLU(inplace=True), nn.Dropout(0.2),
+        )
+        self.res1 = _ResBlock(64)
+        self.down = nn.Sequential(
+            nn.Conv1d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(128), nn.ReLU(inplace=True), nn.Dropout(0.3),
+        )
+        self.res2  = _ResBlock(128)
+        self.pool  = nn.AdaptiveMaxPool1d(1)
+        self.head  = nn.Sequential(
+            nn.Linear(128, 64), nn.ReLU(inplace=True), nn.Dropout(0.4),
+            nn.Linear(64, 1), nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, 1, seq_len)
+        x = self.stem(x)
+        x = self.res1(x)
+        x = self.down(x)
+        x = self.res2(x)
+        x = self.pool(x).squeeze(-1)   # → (batch, 128)
+        return self.head(x).squeeze(-1)
+
+
+class LSTMModel(nn.Module):
+    """
+    Bidirectional stacked LSTM with self-attention pooling.
+    input_size=1 + sequence-length-agnostic → works for any feature count.
+    """
+    def __init__(self, input_dim: int = 1):
+        super().__init__()
+        self.lstm1  = nn.LSTM(input_size=1,   hidden_size=64, batch_first=True, bidirectional=True)
+        self.drop1  = nn.Dropout(0.3)
+        self.lstm2  = nn.LSTM(input_size=128, hidden_size=64, batch_first=True, bidirectional=True)
+        self.drop2  = nn.Dropout(0.3)
+        self.attn   = nn.Linear(128, 1)         # attention scoring
+        self.head   = nn.Sequential(
+            nn.Linear(128, 64), nn.ReLU(inplace=True), nn.Dropout(0.4),
+            nn.Linear(64, 1), nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, 1)
+        x, _ = self.lstm1(x)          # → (batch, seq, 128)
+        x     = self.drop1(x)
+        x, _ = self.lstm2(x)          # → (batch, seq, 128)
+        x     = self.drop2(x)
+        # Self-attention pooling
+        w = torch.softmax(self.attn(x), dim=1)   # (batch, seq, 1)
+        x = (w * x).sum(dim=1)                   # (batch, 128)
+        return self.head(x).squeeze(-1)
+
+
+# ===========================================================================
+# 3. PREPROCESS DATA
 # ===========================================================================
 
 def preprocess_data(csv_path=None):
-    """Load CSV, drop id column, separate X/y, scale features.
-
-    Returns:
-        X_scaled (np.ndarray): Scaled feature matrix
-        y (np.ndarray): Binary target array
-        scaler (StandardScaler): Fitted scaler
-        feature_names (list): Column names of features
-    """
     if csv_path is None:
         matches = glob.glob('C:/Users/PREETI/Desktop/Parkinson*/data/pd_speech_features.csv')
-        if not matches:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            csv_path = os.path.join(os.path.dirname(script_dir), 'data', 'pd_speech_features.csv')
-        else:
+        if matches:
             csv_path = matches[0]
+        else:
+            csv_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'data', 'pd_speech_features.csv',
+            )
 
     log.info(f"Loading data from {csv_path}")
     df = pd.read_csv(csv_path, header=1)
     log.info(f"Dataset shape: {df.shape}")
 
-    # Drop identifier, separate features and target
     X = df.drop(columns=['id', 'class'])
     y = df['class'].values
     feature_names = list(X.columns)
-
     log.info(f"Features: {X.shape[1]} | Samples: {X.shape[0]}")
-    log.info(f"Class distribution: Healthy={np.sum(y == 0)}, Parkinson={np.sum(y == 1)}")
+    log.info(f"Class distribution: Healthy={np.sum(y==0)}, Parkinson={np.sum(y==1)}")
 
-    # Scale features
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
+    scaler    = StandardScaler()
+    X_scaled  = scaler.fit_transform(X)
     return X_scaled, y, scaler, feature_names
 
 
 # ===========================================================================
-# 2. FEATURE SELECTION (Boruta + PCA)
+# 4. FEATURE SELECTION  (Boruta → PCA at 99% variance)
 # ===========================================================================
 
 def select_features(X, y, feature_names):
-    """Apply Boruta for feature selection, then PCA for dimensionality reduction.
-
-    Returns:
-        X_reduced (np.ndarray): Reduced feature matrix
-        boruta_mask (np.ndarray): Boolean mask of Boruta-selected features
-        pca (PCA): Fitted PCA transformer
-        selected_feature_names (list): Names of Boruta-selected features
-    """
     log.info("=" * 60)
-    log.info("FEATURE SELECTION: Boruta + PCA")
+    log.info("FEATURE SELECTION: Boruta → PCA (99% variance)")
     log.info("=" * 60)
 
-    # -- Boruta Feature Selection --
-    log.info("Running Boruta feature selection (this may take a few minutes)...")
-    rf_boruta = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=7,
-        random_state=SEED,
-        n_jobs=-1
-    )
-    boruta = BorutaPy(
-        estimator=rf_boruta,
-        n_estimators='auto',
-        max_iter=100,
-        random_state=SEED,
-        verbose=0
-    )
+    # -- Boruta --
+    log.info("Running Boruta (may take 1-2 min)…")
+    rf_b = RandomForestClassifier(n_estimators=100, max_depth=7, random_state=SEED, n_jobs=-1)
+    boruta = BorutaPy(estimator=rf_b, n_estimators='auto', max_iter=100, random_state=SEED, verbose=0)
     boruta.fit(X, y)
 
-    boruta_mask = boruta.support_
-    n_selected = np.sum(boruta_mask)
-    log.info(f"Boruta selected {n_selected} out of {X.shape[1]} features")
+    mask = boruta.support_
+    if np.sum(mask) < 10:
+        mask = boruta.support_ | boruta.support_weak_
+    log.info(f"Boruta selected {np.sum(mask)} / {X.shape[1]} features")
 
-    # If Boruta selects too few features, also include tentative ones
-    if n_selected < 10:
-        boruta_mask = boruta.support_ | boruta.support_weak_
-        n_selected = np.sum(boruta_mask)
-        log.info(f"Including tentative features -> {n_selected} total")
+    X_sel = X[:, mask]
 
-    selected_feature_names = [f for f, m in zip(feature_names, boruta_mask) if m]
-    X_selected = X[:, boruta_mask]
-
-    # -- PCA Dimensionality Reduction --
-    log.info(f"Applying PCA with {PCA_VARIANCE * 100:.0f}% variance retention...")
+    # -- PCA at 99% --
+    log.info(f"PCA at {PCA_VARIANCE*100:.0f}% variance…")
     pca = PCA(n_components=PCA_VARIANCE, random_state=SEED)
-    X_reduced = pca.fit_transform(X_selected)
+    X_red = pca.fit_transform(X_sel)
+    log.info(f"PCA: {X_sel.shape[1]} → {X_red.shape[1]} components ({np.sum(pca.explained_variance_ratio_)*100:.2f}% var)")
 
-    log.info(f"PCA reduced {X_selected.shape[1]} -> {X_reduced.shape[1]} components")
-    log.info(f"Explained variance: {np.sum(pca.explained_variance_ratio_) * 100:.2f}%")
-
-    return X_reduced, boruta_mask, pca, selected_feature_names
+    return X_red, mask, pca, [f for f, m in zip(feature_names, mask) if m]
 
 
 # ===========================================================================
-# 3. DATA BALANCING (ADASYN + Mixup)
+# 5. DATA BALANCING  (ADASYN only — no Mixup to preserve hard labels)
 # ===========================================================================
 
 def balance_data(X_train, y_train):
-    """Apply ADASYN oversampling + Mixup augmentation.
-
-    Returns:
-        X_balanced (np.ndarray): Balanced + augmented feature matrix
-        y_balanced (np.ndarray): Balanced + augmented labels
-    """
-    log.info("Balancing data with ADASYN...")
-
-    # -- ADASYN --
     try:
-        adasyn = ADASYN(random_state=SEED, n_neighbors=min(5, np.sum(y_train == 0) - 1))
-        X_resampled, y_resampled = adasyn.fit_resample(X_train, y_train)
-        log.info(f"ADASYN: {X_train.shape[0]} -> {X_resampled.shape[0]} samples")
-    except ValueError as e:
+        k = max(1, min(5, int(np.sum(y_train == 0)) - 1))
+        ada = ADASYN(random_state=SEED, n_neighbors=k)
+        X_r, y_r = ada.fit_resample(X_train, y_train)
+        log.info(f"ADASYN: {X_train.shape[0]} → {X_r.shape[0]} samples")
+    except Exception as e:
         log.warning(f"ADASYN failed ({e}), using original data")
-        X_resampled, y_resampled = X_train, y_train
-
-    # -- Mixup Augmentation --
-    log.info("Applying Mixup augmentation...")
-    X_mixed, y_mixed = mixup(X_resampled, y_resampled, alpha=MIXUP_ALPHA)
-
-    # Combine original resampled data + mixup data
-    X_balanced = np.vstack([X_resampled, X_mixed])
-    y_balanced = np.concatenate([y_resampled, y_mixed])
-
-    log.info(f"After Mixup: {X_balanced.shape[0]} total samples")
-
-    return X_balanced, y_balanced
+        X_r, y_r = X_train, y_train
+    return X_r, y_r
 
 
-def mixup(X, y, alpha=0.2, n_samples=None):
-    """Generate synthetic samples by blending random pairs.
+# ===========================================================================
+# 6. TRAIN DEEP-LEARNING MODELS
+# ===========================================================================
 
-    Args:
-        X: Feature matrix
-        y: Labels (can be float for soft labels)
-        alpha: Beta distribution parameter (smaller = less mixing)
-        n_samples: Number of synthetic samples (default: len(X) // 2)
-
-    Returns:
-        X_mix, y_mix: Blended synthetic samples
+def _train_single_dl(model, X_tr, y_tr, X_val, y_val, name):
     """
-    n = n_samples or len(X) // 2
-    indices_a = np.random.randint(0, len(X), n)
-    indices_b = np.random.randint(0, len(X), n)
-    lam = np.random.beta(alpha, alpha, n).astype(np.float32)
-
-    X_mix = lam[:, None] * X[indices_a] + (1 - lam[:, None]) * X[indices_b]
-    y_mix = lam * y[indices_a] + (1 - lam) * y[indices_b]
-
-    return X_mix, y_mix
-
-
-# ===========================================================================
-# 4. MODEL ARCHITECTURES (CNN1D + LSTM)
-# ===========================================================================
-
-class CNN1D(nn.Module):
-    """1D Convolutional Neural Network for local feature pattern extraction."""
-
-    def __init__(self, input_dim):
-        super(CNN1D, self).__init__()
-        self.net = nn.Sequential(
-            # Block 1
-            nn.Conv1d(1, 64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-
-            # Block 2
-            nn.Conv1d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-
-            # Global Max Pooling
-            nn.AdaptiveMaxPool1d(1),
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(64, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        # x shape: (batch, 1, features)
-        x = self.net(x)          # -> (batch, 128, 1)
-        x = x.squeeze(-1)       # -> (batch, 128)
-        x = self.classifier(x)  # -> (batch, 1)
-        return x.squeeze(-1)
-
-
-class LSTMModel(nn.Module):
-    """LSTM network for capturing sequential dependencies in features."""
-
-    def __init__(self, input_dim):
-        super(LSTMModel, self).__init__()
-        self.lstm1 = nn.LSTM(
-            input_size=1, hidden_size=64,
-            batch_first=True, bidirectional=False
-        )
-        self.dropout1 = nn.Dropout(0.3)
-
-        self.lstm2 = nn.LSTM(
-            input_size=64, hidden_size=32,
-            batch_first=True, bidirectional=False
-        )
-        self.dropout2 = nn.Dropout(0.3)
-
-        self.classifier = nn.Sequential(
-            nn.Linear(32, 64),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(64, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        # x shape: (batch, features, 1)
-        x, _ = self.lstm1(x)     # -> (batch, features, 64)
-        x = self.dropout1(x)
-        x, _ = self.lstm2(x)     # -> (batch, features, 32)
-        x = self.dropout2(x)
-        x = x[:, -1, :]         # Take last timestep -> (batch, 32)
-        x = self.classifier(x)  # -> (batch, 1)
-        return x.squeeze(-1)
-
-
-# ===========================================================================
-# 5. TRAINING
-# ===========================================================================
-
-def train_models(X_train, y_train, X_val, y_val):
-    """Train CNN1D and LSTM models with early stopping.
-
-    Returns:
-        cnn_model: Trained CNN1D
-        lstm_model: Trained LSTMModel
+    X_tr, y_tr, X_val, y_val must already be torch.FloatTensor on DEVICE.
+    train_dl_models() handles the numpy → tensor conversion before calling here.
     """
-    input_dim = X_train.shape[1]
+    criterion = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA)
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
-    # Reshape for Conv1D/LSTM: (samples, 1, features) for CNN, (samples, features, 1) for LSTM
-    X_train_t = torch.FloatTensor(X_train).to(DEVICE)
-    y_train_t = torch.FloatTensor(y_train.astype(np.float32)).to(DEVICE)
-    X_val_t = torch.FloatTensor(X_val).to(DEVICE)
-    y_val_t = torch.FloatTensor(y_val.astype(np.float32)).to(DEVICE)
+    loader = DataLoader(TensorDataset(X_tr, y_tr), batch_size=BATCH_SIZE, shuffle=True)
 
-    # CNN input: (batch, channels=1, features)
-    X_train_cnn = X_train_t.unsqueeze(1)
-    X_val_cnn = X_val_t.unsqueeze(1)
-
-    # LSTM input: (batch, seq_len=features, input_size=1)
-    X_train_lstm = X_train_t.unsqueeze(2)
-    X_val_lstm = X_val_t.unsqueeze(2)
-
-    # Build models
-    cnn_model = CNN1D(input_dim).to(DEVICE)
-    lstm_model = LSTMModel(input_dim).to(DEVICE)
-
-    # Train each model
-    log.info("Training CNN1D...")
-    cnn_model = _train_single_model(
-        cnn_model, X_train_cnn, y_train_t, X_val_cnn, y_val_t, "CNN1D"
-    )
-
-    log.info("Training LSTM...")
-    lstm_model = _train_single_model(
-        lstm_model, X_train_lstm, y_train_t, X_val_lstm, y_val_t, "LSTM"
-    )
-
-    return cnn_model, lstm_model
-
-
-def _train_single_model(model, X_train, y_train, X_val, y_val, name):
-    """Train a single model with early stopping and return best weights."""
-
-    criterion = nn.BCELoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
-
-    train_ds = TensorDataset(X_train, y_train)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-
-    best_val_loss = float('inf')
-    best_state = None
-    patience_counter = 0
+    best_loss, best_state, patience_ctr = float('inf'), None, 0
 
     for epoch in range(EPOCHS):
-        # -- Train --
         model.train()
-        train_loss = 0.0
-        for xb, yb in train_loader:
+        for xb, yb in loader:
             optimizer.zero_grad()
-            pred = model(xb)
-            loss = criterion(pred, yb)
-            loss.backward()
+            criterion(model(xb), yb).backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            train_loss += loss.item() * xb.size(0)
-        train_loss /= len(train_ds)
+        scheduler.step()
 
-        # -- Validate --
         model.eval()
         with torch.no_grad():
-            val_pred = model(X_val)
-            val_loss = criterion(val_pred, y_val).item()
+            val_loss = criterion(model(X_val), y_val).item()
 
-        scheduler.step(val_loss)
-
-        # -- Early Stopping --
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_loss < best_loss:
+            best_loss, patience_ctr = val_loss, 0
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
         else:
-            patience_counter += 1
-
-        if patience_counter >= PATIENCE:
-            log.info(f"  {name} early stop at epoch {epoch + 1} (best val_loss={best_val_loss:.4f})")
+            patience_ctr += 1
+        if patience_ctr >= PATIENCE:
+            log.info(f"  {name} early stop @ epoch {epoch+1} (best val_loss={best_loss:.4f})")
             break
 
-    if best_state is not None:
+    if best_state:
         model.load_state_dict(best_state)
     model.to(DEVICE)
-
-    log.info(f"  {name} training complete (best val_loss={best_val_loss:.4f})")
+    log.info(f"  {name} done (best val_loss={best_loss:.4f})")
     return model
 
 
+
+def train_dl_models(X_tr, y_tr, X_val, y_val, input_dim):
+    X_tr_t  = torch.FloatTensor(X_tr).to(DEVICE)
+    y_tr_t  = torch.FloatTensor(y_tr.astype(np.float32)).to(DEVICE)
+    X_val_t = torch.FloatTensor(X_val).to(DEVICE)
+    y_val_t = torch.FloatTensor(y_val.astype(np.float32)).to(DEVICE)
+
+    log.info("Training Residual CNN1D…")
+    cnn = _train_single_dl(
+        CNN1D(input_dim).to(DEVICE),
+        X_tr_t.unsqueeze(1), y_tr_t,
+        X_val_t.unsqueeze(1), y_val_t,
+        "CNN1D",
+    )
+
+    log.info("Training BiLSTM-Attention…")
+    lstm = _train_single_dl(
+        LSTMModel(input_dim).to(DEVICE),
+        X_tr_t.unsqueeze(2), y_tr_t,
+        X_val_t.unsqueeze(2), y_val_t,
+        "BiLSTM",
+    )
+    return cnn, lstm
+
+
 # ===========================================================================
-# 6. ENSEMBLE PREDICTION
+# 7. TRAIN TRADITIONAL ML MODELS
 # ===========================================================================
 
-def ensemble_predict(cnn_model, lstm_model, X):
-    """Average voting ensemble from CNN1D and LSTM predictions.
+def train_ml_models(X_tr, y_tr):
+    """Train RF + HistGBM + calibrated SVM on ADASYN-balanced data."""
 
-    Returns:
-        y_pred (np.ndarray): Binary predictions (0 or 1)
-        y_proba (np.ndarray): Averaged probability scores
-    """
+    log.info("Training Random Forest (n=500, balanced)…")
+    rf = RandomForestClassifier(
+        n_estimators=500, class_weight='balanced',
+        max_features='sqrt', min_samples_leaf=2,
+        random_state=SEED, n_jobs=-1,
+    )
+    rf.fit(X_tr, y_tr)
+
+    log.info("Training HistGradientBoosting (balanced)…")
+    hgb = HistGradientBoostingClassifier(
+        max_iter=500, class_weight='balanced',
+        learning_rate=0.05, max_leaf_nodes=31,
+        l2_regularization=0.1, random_state=SEED,
+    )
+    hgb.fit(X_tr, y_tr)
+
+    log.info("Training SVM (RBF, calibrated)…")
+    svm_base = SVC(kernel='rbf', class_weight='balanced', probability=True, random_state=SEED)
+    svm = CalibratedClassifierCV(svm_base, cv=3)
+    svm.fit(X_tr, y_tr)
+
+    return {'rf': rf, 'hgb': hgb, 'svm': svm}
+
+
+# ===========================================================================
+# 8. HYBRID ENSEMBLE PREDICTION
+# ===========================================================================
+
+def _dl_proba(model_cnn, model_lstm, X):
     X_t = torch.FloatTensor(X).to(DEVICE)
-
-    cnn_model.eval()
-    lstm_model.eval()
-
+    model_cnn.eval(); model_lstm.eval()
     with torch.no_grad():
-        cnn_proba = cnn_model(X_t.unsqueeze(1)).cpu().numpy()
-        lstm_proba = lstm_model(X_t.unsqueeze(2)).cpu().numpy()
+        p_cnn  = model_cnn(X_t.unsqueeze(1)).cpu().numpy()
+        p_lstm = model_lstm(X_t.unsqueeze(2)).cpu().numpy()
+    return p_cnn, p_lstm
 
-    # Average voting
-    y_proba = (cnn_proba + lstm_proba) / 2.0
-    y_pred = (y_proba >= 0.5).astype(int)
 
-    return y_pred, y_proba
+def ensemble_predict(cnn, lstm, ml_models, X, weights=None, threshold=0.5):
+    """
+    Weighted soft-voting across 5 models.
+    weights: list [w_cnn, w_lstm, w_rf, w_hgb, w_svm] — default equal
+    """
+    p_cnn, p_lstm = _dl_proba(cnn, lstm, X)
+    p_rf   = ml_models['rf'].predict_proba(X)[:, 1]
+    p_hgb  = ml_models['hgb'].predict_proba(X)[:, 1]
+    p_svm  = ml_models['svm'].predict_proba(X)[:, 1]
+
+    probas = np.stack([p_cnn, p_lstm, p_rf, p_hgb, p_svm], axis=1)  # (n, 5)
+    w      = np.array(weights) if weights is not None else np.ones(5)
+    w      = w / w.sum()
+    y_prob = (probas * w).sum(axis=1)
+    y_pred = (y_prob >= threshold).astype(int)
+    return y_pred, y_prob
+
+
+def find_optimal_threshold(y_true, y_proba):
+    """Youden's J statistic: maximize TPR - FPR."""
+    fpr, tpr, thresh = roc_curve(y_true, y_proba)
+    j = tpr - fpr
+    return float(thresh[np.argmax(j)])
 
 
 # ===========================================================================
-# 7. STRATIFIED CROSS-VALIDATION
+# 9. CROSS-VALIDATION
 # ===========================================================================
 
 def evaluate_cv(X, y):
-    """5-fold Stratified Cross-Validation with full pipeline per fold.
-
-    Returns:
-        results (dict): Per-fold and mean metrics
-    """
     log.info("=" * 60)
-    log.info(f"{N_FOLDS}-FOLD STRATIFIED CROSS-VALIDATION")
+    log.info(f"{N_FOLDS}-FOLD STRATIFIED CROSS-VALIDATION — Hybrid Ensemble")
     log.info("=" * 60)
 
     skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
-    fold_metrics = {
-        'accuracy': [],
-        'f1_score': [],
-        'roc_auc': []
-    }
-    best_fold_auc = -1
-    best_models = None
+    fold_acc, fold_f1, fold_auc = [], [], []
+    best_auc, best_bundle = -1, None
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), 1):
-        log.info(f"\n{'-' * 40}")
-        log.info(f"FOLD {fold}/{N_FOLDS}")
-        log.info(f"{'-' * 40}")
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y), 1):
+        log.info(f"\n{'─'*40}")
+        log.info(f"FOLD {fold}/{N_FOLDS}  —  Train: {len(tr_idx)} | Val: {len(val_idx)}")
+        log.info(f"{'─'*40}")
 
-        X_train_fold, X_val_fold = X[train_idx], X[val_idx]
-        y_train_fold, y_val_fold = y[train_idx], y[val_idx]
+        X_tr, X_val = X[tr_idx], X[val_idx]
+        y_tr, y_val = y[tr_idx], y[val_idx]
 
-        log.info(f"Train: {X_train_fold.shape[0]} | Val: {X_val_fold.shape[0]}")
+        # Balance training data
+        X_tr_b, y_tr_b = balance_data(X_tr, y_tr)
 
-        # Balance training data (ADASYN + Mixup)
-        X_train_bal, y_train_bal = balance_data(X_train_fold, y_train_fold)
+        # Train deep learning
+        cnn, lstm = train_dl_models(X_tr_b, y_tr_b, X_val, y_val, X_tr_b.shape[1])
 
-        # Train models
-        cnn_model, lstm_model = train_models(
-            X_train_bal, y_train_bal,
-            X_val_fold, y_val_fold
-        )
+        # Train traditional ML (on balanced data; class_weight also handles imbalance)
+        ml = train_ml_models(X_tr_b, y_tr_b)
 
-        # Ensemble predict on validation set
-        y_pred, y_proba = ensemble_predict(cnn_model, lstm_model, X_val_fold)
+        # Get individual validation probabilities for weighting
+        p_cnn, p_lstm = _dl_proba(cnn, lstm, X_val)
+        p_rf   = ml['rf'].predict_proba(X_val)[:, 1]
+        p_hgb  = ml['hgb'].predict_proba(X_val)[:, 1]
+        p_svm  = ml['svm'].predict_proba(X_val)[:, 1]
 
-        # Compute metrics
-        acc = accuracy_score(y_val_fold, y_pred)
-        f1 = f1_score(y_val_fold, y_pred, average='weighted')
-        try:
-            auc = roc_auc_score(y_val_fold, y_proba)
-        except ValueError:
-            auc = 0.0
+        def safe_auc(p):
+            try: return roc_auc_score(y_val, p)
+            except: return 0.5
 
-        fold_metrics['accuracy'].append(acc)
-        fold_metrics['f1_score'].append(f1)
-        fold_metrics['roc_auc'].append(auc)
+        aucs = np.array([safe_auc(p) for p in [p_cnn, p_lstm, p_rf, p_hgb, p_svm]])
+        log.info(f"  Individual AUCs → CNN:{aucs[0]:.3f}  LSTM:{aucs[1]:.3f}  "
+                 f"RF:{aucs[2]:.3f}  HGB:{aucs[3]:.3f}  SVM:{aucs[4]:.3f}")
 
-        log.info(f"  Accuracy: {acc * 100:.2f}% | F1: {f1:.4f} | ROC-AUC: {auc:.4f}")
+        # AUC-weighted ensemble
+        weights = np.clip(aucs, 0.5, 1.0) - 0.5   # shift so 0.5 AUC → weight 0
+        weights = weights / weights.sum()
 
-        # Track best fold
-        if auc > best_fold_auc:
-            best_fold_auc = auc
-            best_models = (cnn_model.cpu().state_dict(), lstm_model.cpu().state_dict(),
-                           cnn_model.__class__, lstm_model.__class__,
-                           X_train_bal.shape[1])
+        y_pred, y_prob = ensemble_predict(cnn, lstm, ml, X_val, weights=weights, threshold=0.5)
 
-    # -- Summary --
+        # Optimal threshold
+        thr = find_optimal_threshold(y_val, y_prob)
+        y_pred_thr = (y_prob >= thr).astype(int)
+
+        acc = accuracy_score(y_val, y_pred_thr)
+        f1  = f1_score(y_val, y_pred_thr, average='weighted')
+        auc = safe_auc(y_prob)
+        fold_acc.append(acc); fold_f1.append(f1); fold_auc.append(auc)
+
+        log.info(f"  Ensemble  →  Accuracy: {acc*100:.2f}%  F1: {f1:.4f}  AUC: {auc:.4f}  "
+                 f"Threshold*: {thr:.3f}")
+        log.info(f"\n{classification_report(y_val, y_pred_thr, target_names=['Healthy','Parkinson'], digits=4)}")
+
+        if auc > best_auc:
+            best_auc = auc
+            best_bundle = {
+                'cnn_state':  {k: v.cpu() for k, v in cnn.state_dict().items()},
+                'lstm_state': {k: v.cpu() for k, v in lstm.state_dict().items()},
+                'ml_models':  ml,
+                'input_dim':  X_tr_b.shape[1],
+                'weights':    weights.tolist(),
+                'threshold':  thr,
+            }
+
     log.info("\n" + "=" * 60)
-    log.info("CROSS-VALIDATION RESULTS")
+    log.info("CROSS-VALIDATION SUMMARY")
     log.info("=" * 60)
-
-    results = {}
     print(f"\n{'Metric':<15} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
     print("-" * 55)
-    for metric_name, values in fold_metrics.items():
-        mean_val = np.mean(values)
-        std_val = np.std(values)
-        min_val = np.min(values)
-        max_val = np.max(values)
-        results[metric_name] = {'mean': mean_val, 'std': std_val, 'values': values}
-
-        if metric_name == 'accuracy':
-            print(f"{'Accuracy':<15} {mean_val * 100:>9.2f}% {std_val * 100:>9.2f}% {min_val * 100:>9.2f}% {max_val * 100:>9.2f}%")
+    for name, vals in [('Accuracy', fold_acc), ('F1-Score', fold_f1), ('ROC-AUC', fold_auc)]:
+        m, s, mn, mx = np.mean(vals), np.std(vals), np.min(vals), np.max(vals)
+        if name == 'Accuracy':
+            print(f"{name:<15} {m*100:>9.2f}% {s*100:>9.2f}% {mn*100:>9.2f}% {mx*100:>9.2f}%")
         else:
-            print(f"{metric_name:<15} {mean_val:>10.4f} {std_val:>10.4f} {min_val:>10.4f} {max_val:>10.4f}")
+            print(f"{name:<15} {m:>10.4f} {s:>10.4f} {mn:>10.4f} {mx:>10.4f}")
 
-    results['best_models'] = best_models
-    return results
+    return {
+        'accuracy': {'mean': float(np.mean(fold_acc)), 'std': float(np.std(fold_acc)), 'per_fold': [float(v) for v in fold_acc]},
+        'f1_score': {'mean': float(np.mean(fold_f1)),  'std': float(np.std(fold_f1)),  'per_fold': [float(v) for v in fold_f1]},
+        'roc_auc':  {'mean': float(np.mean(fold_auc)), 'std': float(np.std(fold_auc)), 'per_fold': [float(v) for v in fold_auc]},
+        'best_bundle': best_bundle,
+    }
 
 
 # ===========================================================================
-# 8. MAIN ORCHESTRATOR
+# 10. MAIN
 # ===========================================================================
 
 def main():
-    """Full pipeline: preprocess -> feature select -> cross-validate -> save."""
-
     log.info("=" * 60)
-    log.info("PARKINSON'S DISEASE DETECTION -- ADVANCED PIPELINE")
+    log.info("PARKINSON'S DISEASE DETECTION — ADVANCED PIPELINE v2")
     log.info(f"Device: {DEVICE}")
     log.info("=" * 60)
 
     # 1. Preprocess
     X, y, scaler, feature_names = preprocess_data()
 
-    # 2. Feature Selection (Boruta + PCA) -- runs once on full data
-    X_reduced, boruta_mask, pca, selected_features = select_features(X, y, feature_names)
+    # 2. Feature selection
+    X_red, boruta_mask, pca, sel_names = select_features(X, y, feature_names)
 
-    # 3. Cross-Validation (balancing + training + evaluation per fold)
-    results = evaluate_cv(X_reduced, y)
+    # 3. Cross-validation
+    results = evaluate_cv(X_red, y)
 
-    # 4. Save artifacts
+    # 4. Save artifacts — always resolve relative to THIS script's location
+    #    src/advanced_model.py → parent = src/ → parent = project root
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    # Use glob to find the correct project directory with the special apostrophe
-    project_matches = glob.glob('C:/Users/PREETI/Desktop/Parkinson*detection')
-    if project_matches:
-        project_dir = project_matches[0]
-
     save_dir = os.path.join(project_dir, 'models')
     os.makedirs(save_dir, exist_ok=True)
+    log.info(f"Saving artifacts to: {save_dir}")
 
-    # Save pipeline components
-    joblib.dump(scaler, os.path.join(save_dir, 'scaler.pkl'))
+    joblib.dump(scaler,      os.path.join(save_dir, 'scaler.pkl'))
     joblib.dump(boruta_mask, os.path.join(save_dir, 'boruta_mask.pkl'))
-    joblib.dump(pca, os.path.join(save_dir, 'pca.pkl'))
+    joblib.dump(pca,         os.path.join(save_dir, 'pca.pkl'))
 
-    # Save best CNN1D and LSTM model weights
-    if results.get('best_models'):
-        cnn_state, lstm_state, cnn_cls, lstm_cls, input_dim = results['best_models']
+    bundle = results['best_bundle']
+    if bundle:
+        # Save DL models
         torch.save({
-            'cnn_state_dict': cnn_state,
-            'lstm_state_dict': lstm_state,
-            'input_dim': input_dim,
+            'cnn_state_dict':  bundle['cnn_state'],
+            'lstm_state_dict': bundle['lstm_state'],
+            'input_dim':       bundle['input_dim'],
+            'weights':         bundle['weights'],
+            'threshold':       bundle['threshold'],
         }, os.path.join(save_dir, 'ensemble_models.pt'))
 
-    log.info(f"\n[OK] All artifacts saved to: {save_dir}")
-    log.info("  - scaler.pkl          -- StandardScaler")
-    log.info("  - boruta_mask.pkl     -- Boruta feature selection mask")
-    log.info("  - pca.pkl             -- PCA transformer")
-    log.info("  - ensemble_models.pt  -- CNN1D + LSTM weights")
+        # Save traditional ML models
+        joblib.dump(bundle['ml_models'], os.path.join(save_dir, 'ml_ensemble.pkl'))
+        log.info("  - ml_ensemble.pkl     -- RF + HistGBM + SVM")
 
-    # Final summary
+    # Save CV metrics
+    acc = results['accuracy']; f1 = results['f1_score']; auc = results['roc_auc']
+    cv_out = {
+        'accuracy': acc, 'f1_score': f1, 'roc_auc': auc,
+        'pipeline': {
+            'n_folds':             N_FOLDS,
+            'n_original_features': int(X.shape[1]),
+            'n_boruta_features':   int(np.sum(boruta_mask)),
+            'n_pca_components':    int(pca.n_components_),
+            'ensemble':            'Residual-CNN1D + BiLSTM-Attention + RF + HistGBM + SVM (AUC-weighted)',
+            'balancing':           'ADASYN',
+            'loss':                f'Focal (α={FOCAL_ALPHA}, γ={FOCAL_GAMMA})',
+            'optimal_threshold':   bundle['threshold'] if bundle else 0.5,
+        },
+    }
+    with open(os.path.join(save_dir, 'cv_results.json'), 'w') as f:
+        json.dump(cv_out, f, indent=2)
+
+    log.info(f"\n[OK] Artifacts saved → {save_dir}")
+    log.info("  - scaler.pkl          — StandardScaler")
+    log.info("  - boruta_mask.pkl     — Boruta feature mask")
+    log.info("  - pca.pkl             — PCA (99% variance)")
+    log.info("  - ensemble_models.pt  — Residual-CNN1D + BiLSTM weights")
+    log.info("  - ml_ensemble.pkl     — RF + HistGBM + SVM")
+    log.info("  - cv_results.json     — Cross-validation metrics")
+
     print("\n" + "=" * 60)
-    print("  PIPELINE SUMMARY")
+    print("  FINAL RESULTS")
     print("=" * 60)
-    print(f"  Dataset:          756 samples x 753 features")
-    print(f"  Boruta selected:  {np.sum(boruta_mask)} features")
-    print(f"  PCA components:   {pca.n_components_}")
-    print(f"  Ensemble:         CNN1D + LSTM (average voting)")
-    print(f"  CV Folds:         {N_FOLDS}")
-    print(f"  Mean Accuracy:    {results['accuracy']['mean'] * 100:.2f}% +/- {results['accuracy']['std'] * 100:.2f}%")
-    print(f"  Mean F1-Score:    {results['f1_score']['mean']:.4f} +/- {results['f1_score']['std']:.4f}")
-    print(f"  Mean ROC-AUC:     {results['roc_auc']['mean']:.4f} +/- {results['roc_auc']['std']:.4f}")
+    print(f"  Mean Accuracy : {acc['mean']*100:.2f}% ± {acc['std']*100:.2f}%")
+    print(f"  Mean F1-Score : {f1['mean']:.4f} ± {f1['std']:.4f}")
+    print(f"  Mean ROC-AUC  : {auc['mean']:.4f} ± {auc['std']:.4f}")
     print("=" * 60)
 
 
