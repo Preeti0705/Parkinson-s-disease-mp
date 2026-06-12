@@ -23,6 +23,14 @@ This project detects the risk of Parkinson’s disease using voice recordings. A
 - **Target Label:**
   - `0` → Healthy  
   - `1` → Parkinson’s Disease  
+  You are provided with datasets containing pre-extracted features from voice recordings:
+- ● UCI Parkinson’s Dataset: https://archive.ics.uci.edu/ml/datasets/parkinsons
+ - ● Parkinson’s Dataset:
+https://archive.ics.uci.edu/dataset/470/parkinson+s+disease+classification
+
+These datasets include acoustic features like pitch (Fo), jitter, shimmer, MFCCs, and
+harmonics-to-noise ratio (HNR) along with labels (0 = healthy, 1 = Parkinson’s).
+Participants are free to use any other datasets or libraries as well.
 
 ---
 
