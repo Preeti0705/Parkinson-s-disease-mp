@@ -1,0 +1,29 @@
+# .gitignore for Parkinson's Disease Voice Detection project
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Large data files - keep the CSV but exclude RAR
+*.rar
+
+# Model artifacts - track .pkl and .pt
+# (they are small enough to version)
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
