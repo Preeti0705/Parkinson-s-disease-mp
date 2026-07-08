@@ -33,6 +33,7 @@ from sklearn.svm import SVC
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
     accuracy_score, f1_score, roc_auc_score, roc_curve, classification_report,
+    precision_score, recall_score
 )
 from imblearn.over_sampling import ADASYN
 from boruta import BorutaPy
@@ -404,7 +405,11 @@ def evaluate_cv(X, y):
 
     skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
-    fold_acc, fold_f1, fold_auc = [], [], []
+    model_names = ['CNN1D', 'BiLSTM', 'Random Forest', 'HistGradientBoosting', 'SVM', 'Ensemble']
+    metrics_tracker = {
+        name: {'acc': [], 'prec': [], 'rec': [], 'f1': [], 'auc': []}
+        for name in model_names
+    }
     best_auc, best_bundle = -1, None
 
     for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y), 1):
@@ -429,6 +434,14 @@ def evaluate_cv(X, y):
         p_rf   = ml['rf'].predict_proba(X_val)[:, 1]
         p_hgb  = ml['hgb'].predict_proba(X_val)[:, 1]
         p_svm  = ml['svm'].predict_proba(X_val)[:, 1]
+        
+        probas_dict = {
+            'CNN1D': p_cnn,
+            'BiLSTM': p_lstm,
+            'Random Forest': p_rf,
+            'HistGradientBoosting': p_hgb,
+            'SVM': p_svm
+        }
 
         def safe_auc(p):
             try: return roc_auc_score(y_val, p)
@@ -444,21 +457,36 @@ def evaluate_cv(X, y):
 
         y_pred, y_prob = ensemble_predict(cnn, lstm, ml, X_val, weights=weights, threshold=0.5)
 
-        # Optimal threshold
+        # Optimal threshold from ensemble
         thr = find_optimal_threshold(y_val, y_prob)
-        y_pred_thr = (y_prob >= thr).astype(int)
+        probas_dict['Ensemble'] = y_prob
+        
+        # Calculate and store metrics for all models
+        for name, p in probas_dict.items():
+            auc = safe_auc(p)
+            pred = (p >= thr).astype(int)
+            
+            acc = accuracy_score(y_val, pred)
+            prec = precision_score(y_val, pred, zero_division=0)
+            rec = recall_score(y_val, pred, zero_division=0)
+            f1 = f1_score(y_val, pred, average='weighted')
+            
+            metrics_tracker[name]['acc'].append(acc)
+            metrics_tracker[name]['prec'].append(prec)
+            metrics_tracker[name]['rec'].append(rec)
+            metrics_tracker[name]['f1'].append(f1)
+            metrics_tracker[name]['auc'].append(auc)
 
-        acc = accuracy_score(y_val, y_pred_thr)
-        f1  = f1_score(y_val, y_pred_thr, average='weighted')
-        auc = safe_auc(y_prob)
-        fold_acc.append(acc); fold_f1.append(f1); fold_auc.append(auc)
+        acc_ens = metrics_tracker['Ensemble']['acc'][-1]
+        f1_ens = metrics_tracker['Ensemble']['f1'][-1]
+        auc_ens = metrics_tracker['Ensemble']['auc'][-1]
 
-        log.info(f"  Ensemble  →  Accuracy: {acc*100:.2f}%  F1: {f1:.4f}  AUC: {auc:.4f}  "
+        log.info(f"  Ensemble  →  Accuracy: {acc_ens*100:.2f}%  F1: {f1_ens:.4f}  AUC: {auc_ens:.4f}  "
                  f"Threshold*: {thr:.3f}")
-        log.info(f"\n{classification_report(y_val, y_pred_thr, target_names=['Healthy','Parkinson'], digits=4)}")
+        log.info(f"\n{classification_report(y_val, (y_prob >= thr).astype(int), target_names=['Healthy','Parkinson'], digits=4)}")
 
-        if auc > best_auc:
-            best_auc = auc
+        if auc_ens > best_auc:
+            best_auc = auc_ens
             best_bundle = {
                 'cnn_state':  {k: v.cpu() for k, v in cnn.state_dict().items()},
                 'lstm_state': {k: v.cpu() for k, v in lstm.state_dict().items()},
@@ -468,22 +496,29 @@ def evaluate_cv(X, y):
                 'threshold':  thr,
             }
 
-    log.info("\n" + "=" * 60)
-    log.info("CROSS-VALIDATION SUMMARY")
-    log.info("=" * 60)
-    print(f"\n{'Metric':<15} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
-    print("-" * 55)
-    for name, vals in [('Accuracy', fold_acc), ('F1-Score', fold_f1), ('ROC-AUC', fold_auc)]:
-        m, s, mn, mx = np.mean(vals), np.std(vals), np.min(vals), np.max(vals)
-        if name == 'Accuracy':
-            print(f"{name:<15} {m*100:>9.2f}% {s*100:>9.2f}% {mn*100:>9.2f}% {mx*100:>9.2f}%")
-        else:
-            print(f"{name:<15} {m:>10.4f} {s:>10.4f} {mn:>10.4f} {mx:>10.4f}")
+    log.info("\n" + "=" * 90)
+    log.info("CROSS-VALIDATION SUMMARY (INDIVIDUAL MODELS & ENSEMBLE)")
+    log.info("=" * 90)
+    
+    print(f"\n| {'Model':<20} | {'Accuracy':<15} | {'Precision':<15} | {'Recall':<15} | {'F1-Score':<15} | {'ROC-AUC':<15} |")
+    print(f"|{'-'*22}|{'-'*17}|{'-'*17}|{'-'*17}|{'-'*17}|{'-'*17}|")
+    
+    for name in model_names:
+        m_acc, s_acc = np.mean(metrics_tracker[name]['acc']), np.std(metrics_tracker[name]['acc'])
+        m_pre, s_pre = np.mean(metrics_tracker[name]['prec']), np.std(metrics_tracker[name]['prec'])
+        m_rec, s_rec = np.mean(metrics_tracker[name]['rec']), np.std(metrics_tracker[name]['rec'])
+        m_f1,  s_f1  = np.mean(metrics_tracker[name]['f1']),  np.std(metrics_tracker[name]['f1'])
+        m_auc, s_auc = np.mean(metrics_tracker[name]['auc']), np.std(metrics_tracker[name]['auc'])
+        
+        print(f"| {name:<20} | {m_acc:.4f}±{s_acc:.4f} | {m_pre:.4f}±{s_pre:.4f} | {m_rec:.4f}±{s_rec:.4f} | {m_f1:.4f}±{s_f1:.4f} | {m_auc:.4f}±{s_auc:.4f} |")
+    
+    print("")
 
+    ens_metrics = metrics_tracker['Ensemble']
     return {
-        'accuracy': {'mean': float(np.mean(fold_acc)), 'std': float(np.std(fold_acc)), 'per_fold': [float(v) for v in fold_acc]},
-        'f1_score': {'mean': float(np.mean(fold_f1)),  'std': float(np.std(fold_f1)),  'per_fold': [float(v) for v in fold_f1]},
-        'roc_auc':  {'mean': float(np.mean(fold_auc)), 'std': float(np.std(fold_auc)), 'per_fold': [float(v) for v in fold_auc]},
+        'accuracy': {'mean': float(np.mean(ens_metrics['acc'])), 'std': float(np.std(ens_metrics['acc'])), 'per_fold': [float(v) for v in ens_metrics['acc']]},
+        'f1_score': {'mean': float(np.mean(ens_metrics['f1'])),  'std': float(np.std(ens_metrics['f1'])), 'per_fold': [float(v) for v in ens_metrics['f1']]},
+        'roc_auc':  {'mean': float(np.mean(ens_metrics['auc'])), 'std': float(np.std(ens_metrics['auc'])), 'per_fold': [float(v) for v in ens_metrics['auc']]},
         'best_bundle': best_bundle,
     }
 

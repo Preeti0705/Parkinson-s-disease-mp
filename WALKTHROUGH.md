@@ -9,11 +9,11 @@
 4. [Every File Explained](#4-every-file-explained)
 5. [Architecture Diagrams](#5-architecture-diagrams)
 6. [The Complete ML Pipeline](#6-the-complete-ml-pipeline)
-7. [How Evaluation Works](#7-how-evaluation-works)
-8. [How Metrics Are Computed](#8-how-metrics-are-computed)
-9. [The Streamlit App](#9-the-streamlit-app)
-10. [Commands Reference](#10-commands-reference)
-11. [End-to-End Flow Diagram](#11-end-to-end-flow-diagram)
+7. [Why This Ensemble is Superior](#7-why-this-ensemble-is-superior)
+8. [How Evaluation Works](#8-how-evaluation-works)
+9. [How Metrics Are Computed](#9-how-metrics-are-computed)
+10. [The Streamlit App](#10-the-streamlit-app)
+11. [Commands Reference](#11-commands-reference)
 
 ---
 
@@ -25,12 +25,12 @@
 - **Shimmer** — irregular fluctuations in vocal loudness (amplitude)
 - **HNR** — lower ratio of harmonic (voice) to noise (breathiness/hoarseness)
 
-These biomarkers can be measured from a simple sustained vowel sound ("ahhh"). The goal of this project is to **automatically detect Parkinson's disease from a voice recording** using machine learning.
+These biomarkers can be measured from a simple sustained vowel sound ("ahhh"). The goal of this project is to **automatically detect Parkinson's disease from a voice recording's acoustic features** using machine learning.
 
-### Why voice?
-- **Non-invasive** — just speak into a microphone
-- **Accessible** — no hospital equipment needed
-- **Early indicator** — voice changes appear early in PD progression
+### The Shift to a Research Demonstration Pipeline
+Initially, this project attempted to extract a small subset of features (13) directly from a live microphone in the browser. However, the models were trained on **753 highly complex clinical features** extracted using specialized laboratory equipment. This created a massive **training-inference mismatch**, drastically dropping the accuracy from ~92% in training to ~50% (random guessing) during live inference. 
+
+To resolve this, the project was restructured into a **methodologically flawless Research Demonstration Pipeline**. The Streamlit app now accepts CSV files containing the exact 753-feature format used during training, ensuring **100% parity between training and deployment.**
 
 ---
 
@@ -47,32 +47,18 @@ This is the **UCI Parkinson's Speech Dataset** (Sakar et al., 2019).
 | **Target column** | `class` (0 = Healthy, 1 = Parkinson's) |
 | **Class balance** | 192 Healthy (25%), 564 Parkinson (75%) — **imbalanced** |
 
-### CSV structure
-```
-Row 1: dataset description/header info (skipped with header=1)
-Row 2: column names → id, feature1, feature2, ..., feature753, class
-Row 3+: actual data
-```
-
 ### Feature Categories (753 total)
 The 753 features are computed from sustained vowel sounds across multiple feature extraction methods:
-
-| Feature Group | Description | Count |
-|---|---|---|
-| **Jitter** | Pitch cycle-to-cycle variations | ~5 |
-| **Shimmer** | Amplitude cycle-to-cycle variations | ~6 |
-| **HNR / NHR** | Harmonic-to-noise ratio | ~2 |
-| **MFCC** | Mel-Frequency Cepstral Coefficients (vocal tract shape) | ~many |
-| **Wavelet** | Time-frequency features | ~many |
-| **RPDE** | Recurrence Period Density Entropy | ~few |
-| **DFA** | Detrended Fluctuation Analysis | ~few |
-| **PPE** | Pitch Period Entropy | ~few |
+- **Jitter & Shimmer**
+- **MFCC** (Mel-Frequency Cepstral Coefficients)
+- **Wavelet** (Time-frequency features)
+- **RPDE, DFA, PPE** (Entropy and Fluctuation analysis)
 
 ### Why is class imbalance a problem?
-If the model just predicts **"Parkinson's" for everyone**, it gets 75% accuracy without learning anything! We need special techniques to handle this:
-- **ADASYN** — generates synthetic minority (Healthy) samples during training
-- **Focal Loss** — penalizes the model more for misclassifying Healthy samples
-- **class_weight='balanced'** — in RF/SVM, increases penalty for minority class errors
+If the model just predicts **"Parkinson's" for everyone**, it gets 75% accuracy without learning anything! We handle this via:
+- **ADASYN** — generates synthetic minority (Healthy) samples during training.
+- **Focal Loss** — penalizes neural networks more for misclassifying Healthy samples.
+- **class_weight='balanced'** — increases penalty for minority class errors in RF/SVM.
 
 ---
 
@@ -81,296 +67,61 @@ If the model just predicts **"Parkinson's" for everyone**, it gets 75% accuracy 
 ```
 Parkinson's_disease_voice_detection_mp/
 │
-├── app.py                    ← Streamlit web application (main entry point)
-├── dataprep.py               ← Exploratory data preparation script
+├── app.py                    ← Streamlit web application (Research Demo)
 ├── requirements.txt          ← Python dependencies
-├── .gitignore                ← Files excluded from git
+├── evaluate_saved_models.py  ← Standalone evaluation script for deployment artifacts
 │
 ├── data/
-│   └── pd_speech_features.csv   ← ONLY dataset used for training
+│   └── pd_speech_features.csv   ← The dataset
 │
-├── models/                   ← Saved trained artifacts (generated by training)
-│   ├── scaler.pkl            ← StandardScaler fitted on all 753 features
-│   ├── boruta_mask.pkl       ← Boolean mask of Boruta-selected features
-│   ├── pca.pkl               ← PCA transformer (99% variance)
-│   ├── ensemble_models.pt    ← CNN1D + BiLSTM neural network weights
+├── models/                   ← Saved trained artifacts
+│   ├── scaler.pkl            ← StandardScaler fitted on 753 features
+│   ├── boruta_mask.pkl       ← Boolean mask of Boruta-selected features (131)
+│   ├── pca.pkl               ← PCA transformer (99% variance → 69 components)
+│   ├── ensemble_models.pt    ← CNN1D + BiLSTM neural network weights + Optimal Threshold
 │   ├── ml_ensemble.pkl       ← RF + HistGBM + SVM trained models
 │   └── cv_results.json       ← Cross-validation metrics for display in app
 │
 └── src/
-    ├── __init__.py           ← Makes src/ a Python package
+    ├── __init__.py           
     ├── advanced_model.py     ← MAIN training pipeline (run this to train)
-    ├── inference_models.py   ← Lightweight CNN+LSTM for app inference
-    ├── audio_prepro.py       ← Real-time audio feature extraction
-    ├── extract_features.py   ← Alternative feature extractor (unused)
-    └── model.py              ← Legacy basic Random Forest (historical only)
+    └── inference_models.py   ← Lightweight CNN+LSTM network definitions for the app
 ```
 
 ---
 
 ## 4. Every File Explained
 
----
-
 ### `requirements.txt`
-Lists all Python packages needed:
+Dependencies including `torch`, `scikit-learn`, `imbalanced-learn`, `boruta`, and `streamlit`. 
 
-```
-pandas>=1.5           → data manipulation (DataFrames)
-scikit-learn>=1.2     → ML models, scaling, PCA, metrics
-imbalanced-learn>=0.10 → ADASYN oversampling
-joblib>=1.2           → saving/loading sklearn models
-boruta>=0.4           → Boruta feature selection
-torch>=2.12           → CNN1D + BiLSTM neural networks
-praat-parselmouth>=0.4.3 → acoustic feature extraction from audio
-soundfile>=0.12       → reading audio files
-librosa>=0.11         → audio processing utilities
-streamlit-audiorec    → microphone recording widget in Streamlit
-numpy>=2.0            → numerical computing
-```
+### `src/inference_models.py`
+Defines **only the neural network class structures** (CNN1D and LSTMModel). It's lightweight and safe to import in the Streamlit app without pulling in training dependencies.
 
-**Install all with:**
-```powershell
-pip install -r requirements.txt
-```
+### `src/advanced_model.py`
+The heart of the project. Running this executes the complete 5-fold Stratified CV pipeline, trains all 5 models independently, computes the optimal ensemble threshold, tracks metrics for every model across every fold, and saves the best fold's artifacts to the `models/` directory.
 
----
+### `evaluate_saved_models.py`
+A rigid deployment evaluation script. It loads the exact saved artifacts from `models/` and evaluates the raw `pd_speech_features.csv` dataset against them independently. It applies the saved `scaler → boruta → pca` pipeline, loads the models, and prints a final comparison table of Accuracy, Precision, Recall, F1, and AUC for all models.
 
-### `src/audio_prepro.py` — Real-time Audio Feature Extractor
-
-This file is used **at inference time** when the user records their voice in the app.
-
-**What it does:**
-1. Loads the `.wav` audio file using `parselmouth` (Python wrapper for Praat — the gold-standard acoustic analysis tool)
-2. Extracts a **PointProcess** (sequence of vocal fold closure moments)
-3. Computes 13 acoustic features from that PointProcess:
-
-```python
-# JITTER (5 features) — pitch irregularity
-jitter_local    = % variation between consecutive pitch periods
-jitter_abs      = absolute variation in pitch periods (seconds)
-jitter_rap      = relative average perturbation (3-period window)
-jitter_ppq5     = pitch perturbation quotient (5-period window)
-jitter_ddp      = average absolute difference of differences
-
-# SHIMMER (6 features) — amplitude irregularity
-shimmer_local   = % amplitude variation between consecutive cycles
-shimmer_db      = amplitude variation in decibels
-shimmer_apq3    = amplitude perturbation quotient (3-cycle window)
-shimmer_apq5    = amplitude perturbation quotient (5-cycle window)
-shimmer_apq11   = amplitude perturbation quotient (11-cycle window)
-shimmer_dda     = difference of differences of amplitude
-
-# NOISE (2 features)
-nhr             = Noise-to-Harmonic Ratio (higher = more noise)
-hnr             = Harmonic-to-Noise Ratio (higher = cleaner voice)
-```
-
-**Output:** A numpy array of shape `(13,)`
-
-**Why 13 features vs 753 in the CSV?**
-The CSV has 753 features computed in a research lab with specialized equipment. Real-time extraction from a browser microphone can only reliably compute the 13 core acoustic features. The models handle this because both CNN1D and BiLSTM use dimension-agnostic architectures (AdaptiveMaxPool / sequence length flexibility).
-
----
-
-### `src/inference_models.py` — Lightweight Model Architectures
-
-This file defines **only the neural network class structures** — no training imports. It's safe to import in the Streamlit app without pulling in `boruta`, `ADASYN`, or other heavy training dependencies.
-
-#### `CNN1D` — Residual 1D Convolutional Network
-
-```
-Input: (batch, 1, 13)  ← 13 audio features as a 1D sequence
-  ↓
-Stem Conv (1→64 channels, kernel=5)
-  ↓
-ResBlock 1 (64 channels):  Conv→BN→ReLU→Dropout→Conv→BN + skip connection
-  ↓
-Downsample (64→128 channels)
-  ↓
-ResBlock 2 (128 channels):  same structure
-  ↓
-AdaptiveMaxPool1d(1) ← collapses any sequence length to 1
-  ↓
-Linear(128→64)→ReLU→Dropout→Linear(64→1)→Sigmoid
-Output: (batch,) probability of Parkinson's
-```
-
-**Why residual blocks?** Skip connections (`x + block(x)`) prevent vanishing gradients, allowing deeper networks to train effectively. The signal can bypass layers that aren't learning anything useful.
-
-**Why AdaptiveMaxPool1d(1)?** This reduces any sequence length (13 features, 41 PCA components, 69 PCA components) to a single value — making the model **dimension-agnostic**. Trained on 69 features, runs inference on 13 features. ✅
-
-#### `LSTMModel` — Bidirectional LSTM with Self-Attention
-
-```
-Input: (batch, 13, 1)  ← 13 features treated as 13 time steps
-  ↓
-BiLSTM Layer 1 (input=1, hidden=64, bidirectional) → output: (batch, 13, 128)
-  ↓ Dropout
-BiLSTM Layer 2 (input=128, hidden=64, bidirectional) → output: (batch, 13, 128)
-  ↓ Dropout
-Self-Attention: score each timestep, weighted sum → (batch, 128)
-  ↓
-Linear(128→64)→ReLU→Dropout→Linear(64→1)→Sigmoid
-Output: (batch,) probability of Parkinson's
-```
-
-**Why bidirectional?** Reads the feature sequence both forward AND backward, capturing dependencies from both directions.
-
-**Why self-attention?** Not all 13 features are equally important. Attention learns to assign higher weight to the most discriminative features dynamically.
-
----
-
-### `src/advanced_model.py` — The Main Training Pipeline
-
-This is the heart of the project. Running `python src/advanced_model.py` executes the complete pipeline and saves all model artifacts.
-
-#### Step-by-step walkthrough:
-
-**Step 1: Load Data**
-```python
-df = pd.read_csv('data/pd_speech_features.csv', header=1)
-X = df.drop(columns=['id', 'class'])   # 753 features
-y = df['class'].values                  # 0 or 1 labels
-```
-
-**Step 2: StandardScaler**
-```python
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-```
-Centers each feature to mean=0 and scales to std=1. Critical because:
-- Features have wildly different ranges (e.g., HNR ~20, Jitter ~0.002)
-- Distance-based algorithms (SVM) and gradient descent (neural nets) assume similar scales
-
-**Step 3: Boruta Feature Selection (131 of 753 features)**
-
-Boruta is a wrapper around Random Forest that identifies **statistically relevant features**:
-1. Creates "shadow" copies of each feature with randomly shuffled values
-2. Trains RF on real + shadow features
-3. Features that consistently beat their shadow counterparts are selected
-4. Reduces 753 → 131 features, removing noise
-
-```python
-rf_b = RandomForestClassifier(n_estimators=100, max_depth=7)
-boruta = BorutaPy(estimator=rf_b, n_estimators='auto', max_iter=100)
-boruta.fit(X_scaled, y)
-mask = boruta.support_   # boolean mask of selected features
-X_selected = X_scaled[:, mask]  # 131 features
-```
-
-**Step 4: PCA (99% variance → 69 components)**
-
-PCA (Principal Component Analysis) reduces the 131 Boruta-selected features to 69 principal components while retaining 99.04% of the information.
-
-```python
-pca = PCA(n_components=0.99)   # keep components until 99% variance explained
-X_reduced = pca.fit_transform(X_selected)  # 131 → 69
-```
-
-Why PCA after Boruta?
-- Removes remaining collinearity (correlated features)
-- Reduces input dimensionality for neural networks
-- 99% variance means we lose only 1% of information
-
-**Step 5: 5-Fold Stratified Cross-Validation**
-
-This is how we get trustworthy accuracy estimates. See Section 6 for detailed explanation.
-
-**Step 6: Per-fold training of 5 models:**
-
-*(a) ADASYN Balancing*
-```python
-adasyn = ADASYN(n_neighbors=5)
-X_balanced, y_balanced = adasyn.fit_resample(X_train, y_train)
-# 604 → 876 samples (generates synthetic Healthy samples)
-```
-
-*(b) Train Residual CNN1D with Focal Loss*
-*(c) Train BiLSTM-Attention with Focal Loss*
-*(d) Train RandomForest(n=500, class_weight='balanced')*
-*(e) Train HistGradientBoosting(class_weight='balanced')*
-*(f) Train Calibrated SVM (RBF kernel)*
-
-**Step 7: AUC-weighted ensemble**
-```python
-# Compute each model's validation AUC
-aucs = [auc_cnn, auc_lstm, auc_rf, auc_hgb, auc_svm]
-
-# Weight proportional to AUC (better models get more say)
-weights = np.clip(aucs, 0.5, 1.0) - 0.5  # subtract 0.5 (random baseline)
-weights = weights / weights.sum()
-
-# Weighted average of all 5 probabilities
-y_prob = sum(w_i * p_i for w_i, p_i in zip(weights, probas))
-```
-
-**Step 8: Optimal Threshold (Youden's J)**
-```python
-fpr, tpr, thresholds = roc_curve(y_val, y_prob)
-j_scores = tpr - fpr
-optimal_threshold = thresholds[argmax(j_scores)]
-# predict Parkinson's if prob >= optimal_threshold
-```
-
-The default threshold of 0.5 is rarely optimal for imbalanced datasets. This finds the threshold that **maximizes TPR - FPR simultaneously**.
-
-**Step 9: Save all artifacts to `models/`**
-
----
-
-### `src/model.py` — Legacy Basic Random Forest (Historical)
-
-This was the first, simple version of the model. It:
-- Loaded `pd_speech_features.csv`
-- Trained a basic RandomForestClassifier (no CV, no balancing)
-- Saved `parkinsons_rf_model.pkl` and `scaler.pkl` to root
-
-**This file is NOT used by the app.** It's kept for historical reference only. The current pipeline is entirely in `advanced_model.py`.
-
----
-
-### `app.py` — The Streamlit Web Application
-
-This is the user-facing application. Run with:
-```powershell
-streamlit run app.py
-```
-
-**What it does on startup:**
-1. Loads `models/ensemble_models.pt` → CNN1D + BiLSTM weights + optimal threshold
-2. Builds an audio StandardScaler from the 13 matching CSV columns
-3. Loads `models/cv_results.json` → shows metrics in sidebar
-
-**What it does when user records:**
-1. `st_audiorec()` captures microphone audio as bytes
-2. Audio bytes → temp `.wav` file
-3. `extract_features(wav_path)` → 13 acoustic features (numpy array)
-4. Scale features with audio scaler
-5. Run CNN1D and BiLSTM → two probability scores
-6. Average them → ensemble probability
-7. Apply optimal threshold → binary prediction
-8. Show result (Healthy/Parkinson's), risk %, breakdown
-
----
-
-### `dataprep.py` — Exploratory Script
-
-A small helper that downloads/prepares data. Not part of the main pipeline.
+### `app.py`
+The Streamlit application. It acts as the Research Demo:
+1. Loads the saved ensemble and preprocessing artifacts.
+2. Accepts a CSV file upload.
+3. Passes the data through the exact same `scaler → boruta → pca` pipeline used in training.
+4. Generates predictions using all 5 models and soft-votes them.
+5. Displays a rich interactive dashboard with probabilities and performance metrics.
 
 ---
 
 ## 5. Architecture Diagrams
 
-### 5.1 Full System Architecture
-
-This diagram shows the complete system: how data flows from the CSV through feature engineering into the hybrid ensemble during training, and how a live microphone recording flows through the deep learning models during inference.
+### Full System Architecture
 
 ```mermaid
 flowchart TD
     subgraph INPUT[" 📥 INPUT SOURCES "]
         CSV["📄 pd_speech_features.csv\n756 samples × 753 features"]
-        MIC["🎙️ Microphone Recording\nUser says 'ahhh'"]
     end
 
     subgraph PREPROCESS[" 🔧 PREPROCESSING "]
@@ -411,21 +162,12 @@ flowchart TD
         SCALERPKL["scaler.pkl\nboruta_mask.pkl\npca.pkl"]
     end
 
-    subgraph AUDIOFE[" 🎵 REAL-TIME FEATURE EXTRACTION "]
-        PRAAT["Praat via parselmouth\nPointProcess analysis"]
-        FEATS13["13 Acoustic Features\nJitter×5 + Shimmer×6\n+ NHR + HNR"]
-    end
-
-    subgraph INFERENCE[" ⚡ INFERENCE "]
-        AUDIOSCALER["Audio StandardScaler\nFitted on 13 CSV columns"]
-        CNNINF["Residual CNN1D\nP_cnn"]
-        LSTMINF["BiLSTM-Attention\nP_lstm"]
-        AVG["Average\n(P_cnn + P_lstm) / 2"]
+    subgraph INFERENCE[" ⚡ LIVE INFERENCE (app.py) "]
+        UPLOAD["User Uploads CSV"]
+        UPLOAD_PREP["Saved Scaler → Boruta → PCA"]
+        ALL_MODELS["CNN1D + BiLSTM + RF + HGB + SVM"]
+        VOTE_INF["AUC-Weighted Vote"]
         DECISION["Apply θ*\nProb ≥ θ* → Parkinson's\nProb < θ* → Healthy"]
-    end
-
-    subgraph OUTPUT[" 📱 STREAMLIT APP OUTPUT "]
-        RESULT["✅ Healthy / ⚠️ Parkinson's\nRisk % + Confidence\nCV Metrics in Sidebar"]
     end
 
     CSV --> SCALER --> BORUTA --> PCA --> CV
@@ -438,13 +180,12 @@ flowchart TD
     THRESH --> JSON; THRESH --> PT
     SCALER --> SCALERPKL; BORUTA --> SCALERPKL; PCA --> SCALERPKL
 
-    MIC --> PRAAT --> FEATS13 --> AUDIOSCALER
-    AUDIOSCALER --> CNNINF & LSTMINF
-    PT -.loads.-> CNNINF & LSTMINF
-    CNNINF & LSTMINF --> AVG --> DECISION
+    UPLOAD --> UPLOAD_PREP
+    SCALERPKL -.loads.-> UPLOAD_PREP
+    UPLOAD_PREP --> ALL_MODELS
+    PT & PKL -.loads.-> ALL_MODELS
+    ALL_MODELS --> VOTE_INF --> DECISION
     PT -.threshold.-> DECISION
-    JSON -.metrics.-> RESULT
-    DECISION --> RESULT
 
     style INPUT fill:#1e3a5f,color:#e0e7ff
     style PREPROCESS fill:#1a3a2a,color:#d1fae5
@@ -454,111 +195,7 @@ flowchart TD
     style ENSEMBLE fill:#1f2937,color:#fef3c7
     style CV fill:#1e2d40,color:#bfdbfe
     style ARTIFACTS fill:#292524,color:#fef9c3
-    style AUDIOFE fill:#1f2937,color:#fde68a
     style INFERENCE fill:#2d1b69,color:#ede9fe
-    style OUTPUT fill:#064e3b,color:#ecfdf5
-```
-
----
-
-### 5.2 Neural Network Architecture Detail
-
-This diagram shows the internal layer-by-layer structure of both deep learning models.
-
-```mermaid
-flowchart LR
-    subgraph CNN1D_ARCH[" Residual CNN1D "]
-        direction TB
-        A1["Input\n(batch, 1, N)\nN = features"]
-        A2["Stem Conv1d\n1→64 ch, kernel=5\nBatchNorm + ReLU + Dropout"]
-        A3["ResBlock 1\nConv→BN→ReLU→Drop→Conv→BN\n+ skip: x + block x\n64 channels"]
-        A4["Downsample\nConv 64→128 ch, kernel=3\nBatchNorm + ReLU + Dropout"]
-        A5["ResBlock 2\nConv→BN→ReLU→Drop→Conv→BN\n+ skip: x + block x\n128 channels"]
-        A6["AdaptiveMaxPool1d 1\n→ batch × 128\nDimension-Agnostic"]
-        A7["Classifier Head\nLinear 128→64\nReLU + Dropout 0.4\nLinear 64→1\nSigmoid"]
-        A8["Output\nP Parkinsons\n0 to 1"]
-        A1-->A2-->A3-->A4-->A5-->A6-->A7-->A8
-    end
-
-    subgraph BILSTM_ARCH[" BiLSTM + Self-Attention "]
-        direction TB
-        B1["Input\n(batch, N, 1)\nN features as N timesteps"]
-        B2["BiLSTM Layer 1\ninput=1, hidden=64\nbidirectional → output 128\nbatch × N × 128"]
-        B3["Dropout 0.3"]
-        B4["BiLSTM Layer 2\ninput=128, hidden=64\nbidirectional → output 128\nbatch × N × 128"]
-        B5["Dropout 0.3"]
-        B6["Self-Attention\nScore = Linear 128→1\nWeights = Softmax over N\nContext = Σ weight_t × h_t\nbatch × 128"]
-        B7["Classifier Head\nLinear 128→64\nReLU + Dropout 0.4\nLinear 64→1\nSigmoid"]
-        B8["Output\nP Parkinsons\n0 to 1"]
-        B1-->B2-->B3-->B4-->B5-->B6-->B7-->B8
-    end
-
-    subgraph FOCAL[" Focal Loss Training "]
-        direction TB
-        F1["FL p = -α × 1-p ^γ × log p"]
-        F2["α = 0.75  γ = 2.0"]
-        F3["Easy examples: p≈1\n1-p ^2 ≈ 0 → small loss"]
-        F4["Hard examples: p≈0\n1-p ^2 ≈ 1 → full loss"]
-        F1---F2---F3---F4
-    end
-
-    style CNN1D_ARCH fill:#2d1b69,color:#ede9fe
-    style BILSTM_ARCH fill:#1a3a5a,color:#bfdbfe
-    style FOCAL fill:#3b1f1f,color:#fde8e8
-```
-
----
-
-### 5.3 Cross-Validation & Ensemble Decision Flow
-
-```mermaid
-flowchart TD
-    DATA["756 labelled samples\n75% Parkinson · 25% Healthy"]
-
-    DATA --> F1["Fold 1\nTrain 604 · Val 152"]
-    DATA --> F2["Fold 2\nTrain 605 · Val 151"]
-    DATA --> F3["Fold 3\nTrain 605 · Val 151"]
-    DATA --> F4["Fold 4\nTrain 605 · Val 151"]
-    DATA --> F5["Fold 5\nTrain 605 · Val 151"]
-
-    F1 & F2 & F3 & F4 & F5 --> ADA["ADASYN\nSynthetic Healthy samples added\nto training set only"]
-
-    ADA --> M1["CNN1D\nP₁"]
-    ADA --> M2["BiLSTM\nP₂"]
-    ADA --> M3["Random Forest\nP₃"]
-    ADA --> M4["HistGBM\nP₄"]
-    ADA --> M5["SVM\nP₅"]
-
-    M1 --> AUC1["AUC₁"]
-    M2 --> AUC2["AUC₂"]
-    M3 --> AUC3["AUC₃"]
-    M4 --> AUC4["AUC₄"]
-    M5 --> AUC5["AUC₅"]
-
-    AUC1 & AUC2 & AUC3 & AUC4 & AUC5 --> W["Weights\nwᵢ = AUCᵢ - 0.5 normalised"]
-
-    W --> ENS["Ensemble Probability\nP = w₁P₁ + w₂P₂ + w₃P₃ + w₄P₄ + w₅P₅"]
-
-    ENS --> ROC["ROC Curve\nFPR vs TPR at every threshold"]
-    ROC --> YOUDEN["Youden J = TPR - FPR\nθ* = argmax J"]
-
-    YOUDEN --> PRED["Predict Parkinson's if P ≥ θ*"]
-
-    PRED --> ACC["Accuracy"]
-    PRED --> F1S["Weighted F1"]
-    ENS --> AUCS["ROC-AUC"]
-
-    ACC & F1S & AUCS --> MEAN["Mean ± Std\nacross 5 folds\n→ Final Reported Metrics"]
-
-    style DATA fill:#1e3a5f,color:#e0e7ff
-    style ADA fill:#3b1f1f,color:#fde8e8
-    style M1 fill:#2d1b69,color:#ede9fe
-    style M2 fill:#2d1b69,color:#ede9fe
-    style M3 fill:#1a3a2a,color:#d1fae5
-    style M4 fill:#1a3a2a,color:#d1fae5
-    style M5 fill:#1a3a2a,color:#d1fae5
-    style ENS fill:#1f2937,color:#fef3c7
-    style MEAN fill:#064e3b,color:#ecfdf5
 ```
 
 ---
@@ -585,20 +222,14 @@ PCA (99% variance)           → 131 → 69 components (99.04% variance kept)
         ├─ ADASYN (604 → 876 training samples)                             │
         │                                                                   │
         ├─ [DL 1] Residual CNN1D  ──────────────┐                          │
-        │   Focal Loss + AdamW + CosineAnnealing │                         │
-        │   PATIENCE=25, EPOCHS=200              │                         │
         │                                        │                         │
         ├─ [DL 2] BiLSTM-Attention ─────────────┤                         │
-        │   Focal Loss + AdamW + CosineAnnealing │                         │
         │                                        │ AUC-weighted            │
         ├─ [ML 1] RandomForest (n=500) ──────────┤ soft voting             │
-        │   class_weight='balanced'              │                         │
         │                                        │                         │
         ├─ [ML 2] HistGradientBoosting ──────────┤                         │
-        │   class_weight='balanced'              │                         │
         │                                        │                         │
         └─ [ML 3] Calibrated SVM (RBF) ──────────┘                        │
-            class_weight='balanced'                                        │
                     │                                                      │
                     ▼                                                      │
         Ensemble Probability = Σ (weight_i × prob_i)                      │
@@ -607,10 +238,10 @@ PCA (99% variance)           → 131 → 69 components (99.04% variance kept)
         Youden's J Optimal Threshold                                       │
                     │                                                      │
                     ▼                                                      │
-        Accuracy / F1 / AUC per fold ──────────────────────────────────────┘
+        Accuracy / Precision / Recall / F1 / AUC per model ────────────────┘
                     │
                     ▼
-        Mean ± Std across 5 folds → final metrics
+        Mean ± Std across 5 folds → final metrics table
                     │
                     ▼
         Save best fold's models → models/
@@ -618,302 +249,87 @@ PCA (99% variance)           → 131 → 69 components (99.04% variance kept)
 
 ---
 
-## 6. How Evaluation Works
+## 7. Why This Ensemble is Superior
 
-### Why Cross-Validation instead of a simple train/test split?
+Detecting Parkinson's from voice is a complex task because the dataset consists of **tabular data that represents sequential audio phenomena**. No single model architecture is perfect for this:
 
-With only 756 samples, a single 80/20 split (604 train, 152 test) gives unreliable metrics — the result depends heavily on **which 152 samples happen to be in the test set**.
+1. **Residual CNN1D:** Excellent at sliding across the feature vector and identifying local, spatial clusters of acoustic anomalies (e.g., correlations between different Jitter metrics).
+2. **BiLSTM with Self-Attention:** Treats the feature vector as a sequence. The Bidirectional LSTM captures long-range dependencies, while the Self-Attention mechanism learns to dynamically "focus" on the most discriminative acoustic biomarkers for a given patient.
+3. **Random Forest & HistGradientBoosting:** Deep learning models can overfit on small datasets (756 samples). Tree-based ensembles are highly robust against overfitting on tabular data and easily model complex non-linear decision boundaries.
+4. **Calibrated SVM:** Maps the 69-dimensional PCA space into an even higher-dimensional space using the RBF kernel to find the mathematically optimal decision hyperplane.
 
-**5-Fold Stratified Cross-Validation** solves this:
+**The Power of AUC-Weighted Voting:**
+If we simply averaged the predictions, a poorly performing model could drag down the entire system. By weighting the vote based on each model's **Validation ROC-AUC score** in that specific fold, the ensemble automatically trusts the strongest models more and ignores the weaker ones. 
 
-```
-All 756 samples
-│
-├─ Fold 1: Train on folds 2+3+4+5 (604) → Test on fold 1 (152)
-├─ Fold 2: Train on folds 1+3+4+5 (605) → Test on fold 2 (151)
-├─ Fold 3: Train on folds 1+2+4+5 (605) → Test on fold 3 (151)
-├─ Fold 4: Train on folds 1+2+3+5 (605) → Test on fold 4 (151)
-└─ Fold 5: Train on folds 1+2+3+4 (605) → Test on fold 5 (151)
-```
-
-**Stratified** means each fold maintains the same class ratio (25% Healthy, 75% Parkinson) as the full dataset — preventing any fold from being all-Parkinson or all-Healthy.
-
-**Result:** Every sample is tested exactly once. The final metric is the average across all 5 folds, with the standard deviation telling us how stable the model is.
-
-### Key rule: ADASYN is applied ONLY to training data, NEVER to test data
-
-```python
-for fold in folds:
-    X_train, X_test = ...
-    X_train_balanced, y_train_balanced = ADASYN().fit_resample(X_train, y_train)
-    # ↑ synthetic samples only in training
-    # X_test remains the original real samples
-    model.train(X_train_balanced, y_train_balanced)
-    predictions = model.predict(X_test)   # real samples only
-```
-
-This is critical — if we added synthetic samples to the test set, we'd be measuring accuracy on fake data.
+This hybrid approach guarantees that whether a patient's Parkinson's manifests via temporal variations (caught by LSTM) or spatial feature correlations (caught by CNN/Trees), the ensemble will detect it.
 
 ---
 
-## 7. How Metrics Are Computed
+## 8. How Evaluation Works
 
-### Accuracy
-```
-Accuracy = (Correct predictions) / (Total predictions)
-         = (TP + TN) / (TP + TN + FP + FN)
-```
-Where:
-- **TP** = True Positives (correctly predicted Parkinson's)
-- **TN** = True Negatives (correctly predicted Healthy)
-- **FP** = False Positives (predicted Parkinson's but actually Healthy)
-- **FN** = False Negatives (predicted Healthy but actually Parkinson's — most dangerous!)
+With only 756 samples, a simple 80/20 train/test split is unreliable. **5-Fold Stratified Cross-Validation** tests every sample exactly once, while maintaining the 75/25 class ratio in every fold. The final metrics are an average across all 5 folds, ensuring the model's performance generalizes well.
 
-### F1-Score (Weighted)
-```
-Precision = TP / (TP + FP)    ← of all Parkinson's predictions, how many were right?
-Recall    = TP / (TP + FN)    ← of all actual Parkinson's cases, how many did we catch?
+**Key Rule regarding ADASYN:**
+ADASYN (synthetic data generation) is applied **ONLY to the training folds**. We never generate synthetic data in the validation fold. We must test on real humans.
 
-F1 = 2 × (Precision × Recall) / (Precision + Recall)
-```
-Weighted F1 accounts for class imbalance by weighting each class's F1 by its support (count).
+---
 
-### ROC-AUC (Area Under the ROC Curve)
-- The ROC curve plots **TPR (sensitivity)** vs **FPR (1-specificity)** at every threshold
-- AUC = area under that curve
-- AUC = 1.0 → perfect model
-- AUC = 0.5 → random guessing
-- AUC = 0.95 → 95% chance the model ranks a random Parkinson's sample higher than a random Healthy sample
+## 9. How Metrics Are Computed
 
-AUC is **threshold-independent** — it measures the model's discriminative power regardless of where you draw the decision line.
+We compute metrics for **every individual model** and the ensemble:
+
+- **Accuracy:** (TP + TN) / Total Predictions
+- **Precision:** Of all predicted Parkinson's cases, how many were actually Parkinson's? (TP / (TP + FP))
+- **Recall:** Of all actual Parkinson's cases, how many did we catch? (TP / (TP + FN))
+- **F1-Score (Weighted):** Harmonic mean of Precision and Recall.
+- **ROC-AUC:** Threshold-independent measure of discriminative power.
 
 ### Youden's J (Optimal Threshold)
+The default threshold of `0.5` is often terrible for imbalanced datasets. We find the optimal threshold by calculating:
 ```
 J(threshold) = TPR(threshold) - FPR(threshold)
-
 Optimal threshold = argmax J(threshold)
 ```
-This finds the threshold that simultaneously maximizes true positive rate AND minimizes false positive rate.
-
-### Code implementation:
-```python
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, roc_curve
-
-# After getting ensemble probabilities y_prob for validation set:
-fpr, tpr, thresholds = roc_curve(y_val, y_prob)
-optimal_threshold = thresholds[np.argmax(tpr - fpr)]
-
-y_pred = (y_prob >= optimal_threshold).astype(int)
-
-acc = accuracy_score(y_val, y_pred)           # e.g., 0.9277
-f1  = f1_score(y_val, y_pred, average='weighted')  # e.g., 0.9241
-auc = roc_auc_score(y_val, y_prob)            # e.g., 0.9670
-```
-
-### Focal Loss — the training loss function
-
-```
-FL(p) = -α × (1 - p)^γ × log(p)
-```
-Where:
-- `p` = predicted probability for the true class
-- `α = 0.75` — upweights positive (Parkinson's) class
-- `γ = 2.0` — down-weights easy examples (if already p=0.9, loss ≈ 0)
-
-When p is close to 1 (easy, well-classified example): `(1-p)^2 ≈ 0` → very small loss
-When p is close to 0 (hard, misclassified example): `(1-p)^2 ≈ 1` → full loss
-
-This makes the model **focus on hard-to-classify Healthy samples** (the minority class).
-
-### Why CNN AUC can differ from ensemble AUC in the app
-
-The app inference uses **only CNN1D + BiLSTM** on 13 audio features.
-The CV metrics include **all 5 models** (CNN + LSTM + RF + HGB + SVM) on 69 PCA features.
-
-The RF/HGB/SVM need all 753 → 131 Boruta → 69 PCA features from the CSV. They cannot process raw audio from a microphone (which only gives 13 features). So the app inference is deep-learning only, while the reported CV metrics reflect the full hybrid ensemble.
+This finds the threshold that simultaneously maximizes the True Positive Rate and minimizes the False Positive Rate. This optimal threshold is saved in `ensemble_models.pt` and used by `evaluate_saved_models.py` and the Streamlit app.
 
 ---
 
-## 8. The Streamlit App
+## 10. The Streamlit App
 
-### How the app works end-to-end:
-
-```
-Browser microphone recording
-        │
-        ▼
-st_audiorec() → audio bytes (WAV format)
-        │
-        ▼
-Write to temp .wav file
-        │
-        ▼
-src/audio_prepro.py → extract_features()
-        │  (Praat acoustic analysis)
-        ▼
-13 features: [jitter×5, shimmer×6, NHR, HNR]
-        │
-        ▼
-StandardScaler.transform()   ← scaler fitted on CSV columns
-        │
-        ▼
-X_tensor shape: (1, 13)
-        │
-        ├──→ CNN1D(X.unsqueeze(1))   → p_cnn  (probability 0-1)
-        │
-        └──→ BiLSTM(X.unsqueeze(2)) → p_lstm (probability 0-1)
-                    │
-                    ▼
-        ensemble_prob = (p_cnn + p_lstm) / 2
-                    │
-                    ▼
-        if prob >= optimal_threshold:
-            prediction = "Parkinson's Detected"
-        else:
-            prediction = "No Parkinson's Indicators"
+Run with:
+```powershell
+streamlit run app.py
 ```
 
-### Sidebar shows:
-- CV metrics from `models/cv_results.json` (Accuracy, F1, AUC per fold)
-- Model description (Hybrid Ensemble v2)
-- Ensemble loaded status + input_dim
-
-### Why is the Streamlit server on port 8502 (not 8501)?
-If port 8501 is already in use (e.g., another Streamlit instance), Streamlit automatically uses 8502. Kill the other instance or use `--server.port 8503` to force a specific port.
+**How it works:**
+1. You upload a CSV file with patient rows (753 features).
+2. It extracts the raw values and passes them through the saved `scaler → boruta_mask → pca`.
+3. It passes the resulting 69-dimensional data through the CNN1D, BiLSTM, RF, HGB, and SVM.
+4. It weights their probabilities using the saved AUC weights.
+5. It applies the saved Youden's J threshold.
+6. It displays a comprehensive dashboard with the results, comparing them to Ground Truth if available.
 
 ---
 
-## 9. Commands Reference
+## 11. Commands Reference
 
 ### Setup
 ```powershell
-# Install dependencies
+.venv\Scripts\activate
 pip install -r requirements.txt
-
-# Verify key libraries
-python -c "import torch, sklearn, streamlit; print('All OK')"
 ```
 
 ### Training
 ```powershell
-# Run the full training pipeline (~15-20 min)
 python src/advanced_model.py
-
-# What it produces:
-# models/scaler.pkl          ← StandardScaler
-# models/boruta_mask.pkl     ← 131-feature boolean mask
-# models/pca.pkl             ← PCA (99% variance)
-# models/ensemble_models.pt  ← CNN1D + BiLSTM weights + optimal threshold
-# models/ml_ensemble.pkl     ← RF + HistGBM + SVM
-# models/cv_results.json     ← accuracy, F1, AUC per fold + mean/std
 ```
 
-### Running the App
+### Independent Model Evaluation
 ```powershell
-# Start Streamlit (opens browser automatically)
+python evaluate_saved_models.py
+```
+
+### Launch Web App
+```powershell
 streamlit run app.py
-
-# Force a specific port
-streamlit run app.py --server.port 8503
 ```
-
-### Git / GitHub
-```powershell
-# Check status
-git status
-
-# Stage, commit, push
-git add -A
-git commit -m "your message"
-git push origin main
-
-# Check current branch
-git branch
-
-# View commit history
-git log --oneline -5
-```
-
-### Cleanup
-```powershell
-# Remove legacy root-level model files
-Remove-Item parkinsons_rf_model.pkl, scaler.pkl
-```
-
----
-
-## 10. End-to-End Flow Diagram
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          TRAINING PHASE                                     │
-│                    (python src/advanced_model.py)                           │
-│                                                                             │
-│  data/pd_speech_features.csv                                                │
-│         │ 756 samples × 753 features                                        │
-│         ▼                                                                   │
-│  StandardScaler ──────────────────────────────→ models/scaler.pkl          │
-│         │                                                                   │
-│         ▼                                                                   │
-│  Boruta (131 features) ────────────────────────→ models/boruta_mask.pkl    │
-│         │                                                                   │
-│         ▼                                                                   │
-│  PCA (99% var → 69 dims) ──────────────────────→ models/pca.pkl            │
-│         │                                                                   │
-│         ▼                                                                   │
-│  5-Fold CV:                                                                 │
-│    ADASYN → Residual CNN1D ─────────────────────┐                          │
-│    ADASYN → BiLSTM-Attention ───────────────────┤ AUC-weighted             │
-│    ADASYN → RandomForest(500) ──────────────────┤ ensemble +               │
-│    ADASYN → HistGradientBoosting ───────────────┤ Youden's J               │
-│    ADASYN → Calibrated SVM ─────────────────────┘ threshold                │
-│         │                                                                   │
-│         ▼                                                                   │
-│  Best fold models saved:                                                    │
-│    models/ensemble_models.pt  (CNN1D + BiLSTM + threshold)                 │
-│    models/ml_ensemble.pkl     (RF + HGB + SVM)                             │
-│    models/cv_results.json     (metrics)                                     │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         INFERENCE PHASE                                     │
-│                       (streamlit run app.py)                                │
-│                                                                             │
-│  User records "ahhh" in browser microphone                                 │
-│         │                                                                   │
-│         ▼                                                                   │
-│  src/audio_prepro.py → 13 features (jitter, shimmer, HNR, NHR)            │
-│         │                                                                   │
-│         ▼                                                                   │
-│  StandardScaler (fitted on 13 CSV cols) → normalized features              │
-│         │                                                                   │
-│         ├──→ Residual CNN1D → P(Parkinson's) score                         │
-│         │                                                                   │
-│         └──→ BiLSTM-Attention → P(Parkinson's) score                       │
-│                    │                                                        │
-│                    ▼                                                        │
-│  Average → apply optimal threshold → Healthy / Parkinson's                 │
-│                    │                                                        │
-│                    ▼                                                        │
-│  Display: result banner + risk % + CV metrics in sidebar                   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📊 Expected Performance
-
-| Model Component | Expected CV AUC |
-|---|---|
-| Residual CNN1D (Focal Loss) | 0.89 – 0.93 |
-| BiLSTM-Attention (Focal Loss) | 0.86 – 0.91 |
-| Random Forest (balanced, n=500) | 0.93 – 0.96 |
-| HistGradientBoosting (balanced) | 0.94 – 0.97 |
-| Calibrated SVM (RBF, balanced) | 0.92 – 0.95 |
-| **Full Hybrid Ensemble (AUC-weighted)** | **0.94 – 0.97 → ~91–95% accuracy** |
-
-> Individual AUCs observed from Fold 1: CNN=0.907, LSTM=0.832, RF=0.940, HGB=0.953, SVM=0.941
-
----
-
-*This guide covers the complete A-Z of the Parkinson's Disease Voice Detection project. For questions or issues, see the [GitHub repository](https://github.com/Preeti0705/Parkinson-s_disease_voice_detection).*
